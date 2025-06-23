@@ -1,0 +1,277 @@
+name: Build Patched WhatsApp
+
+on:
+  # Run daily at 6 AM UTC to check for new WhatsApp versions
+  schedule:
+    - cron: '0 6 * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if no new version'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  build-patched-whatsapp:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Set up Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        # Additional dependencies for web scraping
+        pip install requests beautifulsoup4 lxml
+    
+    - name: Create downloads directory
+      run: mkdir -p downloads
+    
+    - name: Download latest WhatsApp APK from APKMirror
+      id: download_apk
+      run: |
+        python << 'EOF'
+        import requests
+        from bs4 import BeautifulSoup
+        import re
+        import os
+        import sys
+        
+        def get_latest_whatsapp_apk():
+            # APKMirror WhatsApp page
+            base_url = "https://www.apkmirror.com"
+            whatsapp_url = f"{base_url}/apk/whatsapp-inc/whatsapp/"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            try:
+                # Get the main WhatsApp page
+                response = requests.get(whatsapp_url, headers=headers)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Find the latest version link
+                version_links = soup.find_all('a', href=re.compile(r'/apk/whatsapp-inc/whatsapp/whatsapp-[\d\.]+-release/'))
+                
+                if not version_links:
+                    print("No version links found")
+                    return None, None
+                
+                latest_version_url = base_url + version_links[0]['href']
+                version_text = version_links[0].get_text(strip=True)
+                version_match = re.search(r'([\d\.]+)', version_text)
+                version = version_match.group(1) if version_match else "unknown"
+                
+                print(f"Found latest version: {version}")
+                print(f"Version page URL: {latest_version_url}")
+                
+                # Get the version page to find download link
+                response = requests.get(latest_version_url, headers=headers)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Look for the download button/link
+                download_links = soup.find_all('a', href=re.compile(r'/apk/whatsapp-inc/whatsapp/whatsapp-[\d\.]+-release/whatsapp-[\d\.]+-android-apk-download/'))
+                
+                if not download_links:
+                    print("No download links found on version page")
+                    return None, None
+                
+                download_page_url = base_url + download_links[0]['href']
+                print(f"Download page URL: {download_page_url}")
+                
+                # Get the actual download page
+                response = requests.get(download_page_url, headers=headers)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Find the actual download link
+                download_button = soup.find('a', {'class': 'downloadButton'}) or soup.find('a', string=re.compile(r'click here', re.I))
+                
+                if download_button and download_button.get('href'):
+                    actual_download_url = base_url + download_button['href']
+                    print(f"Actual download URL: {actual_download_url}")
+                    return actual_download_url, version
+                else:
+                    print("Could not find actual download link")
+                    return None, None
+                    
+            except Exception as e:
+                print(f"Error scraping APKMirror: {e}")
+                return None, None
+        
+        def download_file(url, filename):
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            try:
+                response = requests.get(url, headers=headers, stream=True)
+                response.raise_for_status()
+                
+                with open(filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                return True
+            except Exception as e:
+                print(f"Error downloading file: {e}")
+                return False
+        
+        # Main execution
+        download_url, version = get_latest_whatsapp_apk()
+        
+        if download_url and version:
+            filename = f"downloads/WhatsApp-{version}.apk"
+            print(f"Downloading WhatsApp {version}...")
+            
+            if download_file(download_url, filename):
+                print(f"Successfully downloaded: {filename}")
+                # Set outputs for GitHub Actions
+                with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                    f.write(f"apk_path={filename}\n")
+                    f.write(f"version={version}\n")
+                    f.write(f"success=true\n")
+            else:
+                print("Failed to download APK")
+                sys.exit(1)
+        else:
+            print("Could not find download URL")
+            sys.exit(1)
+        EOF
+    
+    - name: Check if version already exists
+      id: check_version
+      run: |
+        VERSION="${{ steps.download_apk.outputs.version }}"
+        FORCE_BUILD="${{ github.event.inputs.force_build }}"
+        
+        # Check if release already exists
+        if gh release view "v$VERSION" >/dev/null 2>&1; then
+          echo "Release v$VERSION already exists"
+          if [ "$FORCE_BUILD" != "true" ]; then
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+            echo "Skipping build - release already exists and force_build is not enabled"
+          else
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+            echo "Force build enabled - will rebuild existing version"
+          fi
+        else
+          echo "skip_build=false" >> $GITHUB_OUTPUT
+          echo "New version detected - proceeding with build"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Patch WhatsApp APK
+      if: steps.check_version.outputs.skip_build != 'true'
+      run: |
+        APK_PATH="${{ steps.download_apk.outputs.apk_path }}"
+        VERSION="${{ steps.download_apk.outputs.version }}"
+        OUTPUT_PATH="downloads/PatchedWhatsApp-${VERSION}.apk"
+        
+        echo "Patching WhatsApp APK..."
+        echo "Input: $APK_PATH"
+        echo "Output: $OUTPUT_PATH"
+        
+        # Run the patcher
+        python whatsapp_patcher/main.py -p "$APK_PATH" -o "$OUTPUT_PATH"
+        
+        # Verify the output file exists
+        if [ -f "$OUTPUT_PATH" ]; then
+          echo "Successfully created patched APK: $OUTPUT_PATH"
+          echo "patched_apk_path=$OUTPUT_PATH" >> $GITHUB_OUTPUT
+          
+          # Get file size for release notes
+          SIZE=$(du -h "$OUTPUT_PATH" | cut -f1)
+          echo "apk_size=$SIZE" >> $GITHUB_OUTPUT
+        else
+          echo "Error: Patched APK was not created"
+          exit 1
+        fi
+      id: patch_apk
+    
+    - name: Create Release
+      if: steps.check_version.outputs.skip_build != 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: "v${{ steps.download_apk.outputs.version }}"
+        name: "WhatsApp Patched v${{ steps.download_apk.outputs.version }}"
+        body: |
+          # WhatsApp Patched v${{ steps.download_apk.outputs.version }}
+          
+          ## 🚀 Features Enabled
+          - ✅ Signature Verifier Bypass
+          - ✅ Enable all AB tests
+          - ✅ Keep revoked messages (see deleted messages)
+          - ✅ Disable read receipts
+          - ✅ Save view once media
+          
+          ## 📱 Installation Instructions
+          1. **Backup your chats** before installing
+          2. Enable "Unknown Sources" in Android settings
+          3. Download the APK below
+          4. Install the patched APK
+          5. **Note**: You may need to uninstall official WhatsApp first
+          
+          ## ⚠️ Important Warnings
+          - This violates WhatsApp's Terms of Service
+          - Your account could be banned
+          - Use at your own risk
+          - For educational purposes only
+          
+          ## 📊 Build Info
+          - **Original WhatsApp Version**: ${{ steps.download_apk.outputs.version }}
+          - **APK Size**: ${{ steps.patch_apk.outputs.apk_size }}
+          - **Build Date**: ${{ github.run_started_at }}
+          - **Build ID**: ${{ github.run_id }}
+          
+          ---
+          
+          **Disclaimer**: This is a modified version of WhatsApp. Use responsibly and be aware of potential risks.
+        
+        files: |
+          ${{ steps.patch_apk.outputs.patched_apk_path }}
+        
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Clean up downloads
+      if: always()
+      run: |
+        echo "Cleaning up downloaded files..."
+        rm -rf downloads/
+        echo "Cleanup complete"
+    
+    - name: Build Summary
+      if: always()
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **WhatsApp Version**: ${{ steps.download_apk.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Skip Build**: ${{ steps.check_version.outputs.skip_build }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.check_version.outputs.skip_build }}" != "true" ]; then
+          echo "- **Patched APK**: ${{ steps.patch_apk.outputs.patched_apk_path }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **APK Size**: ${{ steps.patch_apk.outputs.apk_size }}" >> $GITHUB_STEP_SUMMARY
+        fi
