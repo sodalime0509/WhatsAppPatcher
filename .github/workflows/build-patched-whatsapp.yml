@@ -31,7 +31,7 @@ jobs:
       uses: actions/setup-java@v3
       with:
         distribution: 'temurin'
-        java-version: '17'
+        java-version: '11'  # Use Java 11 for better compatibility with APK tools
     
     - name: Install Python dependencies
       run: |
@@ -39,6 +39,46 @@ jobs:
         pip install -r requirements.txt
         # Additional dependencies for web scraping
         pip install requests beautifulsoup4 lxml
+    
+    - name: Set up Android SDK and tools
+      run: |
+        # Install Android SDK command line tools
+        sudo apt-get update
+        sudo apt-get install -y wget unzip
+        
+        # Create Android SDK directory
+        mkdir -p $HOME/android-sdk/cmdline-tools
+        cd $HOME/android-sdk/cmdline-tools
+        
+        # Download and install command line tools
+        wget https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+        unzip commandlinetools-linux-9477386_latest.zip
+        mv cmdline-tools latest
+        
+        # Set environment variables
+        echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+        echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+        echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+        echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+        echo "$HOME/android-sdk/build-tools/33.0.0" >> $GITHUB_PATH
+        
+        # Accept licenses and install required packages
+        yes | $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+        $HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "build-tools;33.0.0"
+    
+    - name: Verify Java and Android tools
+      run: |
+        java -version
+        javac -version
+        which java
+        echo "ANDROID_HOME: $ANDROID_HOME"
+        ls -la $HOME/android-sdk/
+    
+    - name: Make APK signer executable
+      run: |
+        chmod +x bin/uber-apk-signer-1.2.1.jar
+        # Test the APK signer
+        java -jar bin/uber-apk-signer-1.2.1.jar --help || echo "APK signer help failed, but continuing..."
     
     - name: Create downloads directory
       run: mkdir -p downloads
@@ -191,20 +231,64 @@ jobs:
         echo "Patching WhatsApp APK..."
         echo "Input: $APK_PATH"
         echo "Output: $OUTPUT_PATH"
+        echo "Java version: $(java -version 2>&1 | head -n 1)"
+        echo "Working directory: $(pwd)"
+        echo "Available tools:"
+        which java || echo "java not found"
+        which aapt || echo "aapt not found" 
+        which zipalign || echo "zipalign not found"
         
-        # Run the patcher
-        python whatsapp_patcher/main.py -p "$APK_PATH" -o "$OUTPUT_PATH"
+        # List contents to debug
+        echo "Repository contents:"
+        ls -la
+        echo "Bin directory contents:"
+        ls -la bin/ || echo "bin directory not found"
         
-        # Verify the output file exists
+        # Check if input APK exists and is valid
+        if [ ! -f "$APK_PATH" ]; then
+          echo "Error: Input APK not found: $APK_PATH"
+          exit 1
+        fi
+        
+        echo "Input APK size: $(du -h "$APK_PATH")"
+        
+        # Run the patcher with verbose output
+        echo "Running patcher..."
+        python whatsapp_patcher/main.py -p "$APK_PATH" -o "$OUTPUT_PATH" || {
+          echo "Patcher failed. Checking for partial output..."
+          ls -la downloads/ || echo "Downloads directory not found"
+          
+          # Try to get more info about the failure
+          echo "Checking system resources:"
+          df -h
+          free -m
+          
+          # Check if there are any temporary files that might give us clues
+          find /tmp -name "*whatsapp*" -o -name "*apk*" 2>/dev/null || echo "No temp files found"
+          
+          exit 1
+        }
+        
+        # Verify the output file exists and has reasonable size
         if [ -f "$OUTPUT_PATH" ]; then
+          SIZE=$(stat -c%s "$OUTPUT_PATH")
+          if [ $SIZE -lt 50000000 ]; then  # Less than 50MB is suspicious for WhatsApp
+            echo "Warning: Output APK seems too small ($SIZE bytes)"
+            echo "This might indicate a problem with the patching process"
+          fi
+          
           echo "Successfully created patched APK: $OUTPUT_PATH"
           echo "patched_apk_path=$OUTPUT_PATH" >> $GITHUB_OUTPUT
           
           # Get file size for release notes
-          SIZE=$(du -h "$OUTPUT_PATH" | cut -f1)
-          echo "apk_size=$SIZE" >> $GITHUB_OUTPUT
+          HUMAN_SIZE=$(du -h "$OUTPUT_PATH" | cut -f1)
+          echo "apk_size=$HUMAN_SIZE" >> $GITHUB_OUTPUT
+          
+          echo "Final APK size: $HUMAN_SIZE ($SIZE bytes)"
         else
           echo "Error: Patched APK was not created"
+          echo "Checking what files were created:"
+          ls -la downloads/
           exit 1
         fi
       id: patch_apk
